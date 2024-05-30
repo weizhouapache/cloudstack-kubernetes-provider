@@ -32,9 +32,19 @@ import (
 	cloudprovider "k8s.io/cloud-provider"
 )
 
-// defaultAllowedCIDR is the network range that is allowed on the firewall
-// by default when no explicit CIDR list is given on a LoadBalancer.
-const defaultAllowedCIDR = "0.0.0.0/0"
+const (
+	// defaultAllowedCIDR is the network range that is allowed on the firewall
+	// by default when no explicit CIDR list is given on a LoadBalancer.
+	defaultAllowedCIDR = "0.0.0.0/0"
+
+	// ServiceAnnotationLoadBalancerProxyProtocol is the annotation used on the
+	// service to enable the proxy protocol on a CloudStack load balancer.
+	// Note that this protocol only applies to TCP service ports and
+	// CloudStack >= 4.6 is required for it to work.
+	ServiceAnnotationLoadBalancerProxyProtocol = "service.beta.kubernetes.io/cloudstack-load-balancer-proxy-protocol"
+
+	ServiceAnnotationLoadBalancerLoadbalancerHostname = "service.beta.kubernetes.io/cloudstack-load-balancer-hostname"
+)
 
 type loadBalancer struct {
 	*cloudstack.CloudStackClient
@@ -123,7 +133,7 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 
 	for _, port := range service.Spec.Ports {
 		// Construct the protocol name first, we need it a few times
-		protocol := ProtocolFromServicePort(port, service.Annotations)
+		protocol := ProtocolFromServicePort(port, service)
 		if protocol == LoadBalancerProtocolInvalid {
 			return nil, fmt.Errorf("unsupported load balancer protocol: %v", port.Protocol)
 		}
@@ -163,7 +173,15 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 			}
 		}
 
-		if lbRule != nil {
+		network, count, err := lb.Network.GetNetworkByID(lb.networkID, cloudstack.WithProject(lb.projectID))
+		if err != nil {
+			if count == 0 {
+				return nil, err
+			}
+			return nil, err
+		}
+
+		if lbRule != nil && isFirewallSupported(network.Service) {
 			klog.V(4).Infof("Creating firewall rules for load balancer rule: %v (%v:%v:%v)", lbRuleName, protocol, lbRule.Publicip, port.Port)
 			if _, err := lb.updateFirewallRule(lbRule.Publicipid, int(port.Port), protocol, service.Spec.LoadBalancerSourceRanges); err != nil {
 				return nil, err
@@ -194,6 +212,13 @@ func (cs *CSCloud) EnsureLoadBalancer(ctx context.Context, clusterName string, s
 	}
 
 	status = &corev1.LoadBalancerStatus{}
+	// If hostname is explicitly set using service annotation
+	// Workaround for https://github.com/kubernetes/kubernetes/issues/66607
+	if hostname := getStringFromServiceAnnotation(service, ServiceAnnotationLoadBalancerLoadbalancerHostname, ""); hostname != "" {
+		status.Ingress = []corev1.LoadBalancerIngress{{Hostname: hostname}}
+		return status, nil
+	}
+	// Default to IP
 	status.Ingress = []corev1.LoadBalancerIngress{{IP: lb.ipAddr}}
 
 	return status, nil
@@ -242,6 +267,15 @@ func (cs *CSCloud) UpdateLoadBalancer(ctx context.Context, clusterName string, s
 	}
 
 	return nil
+}
+
+func isFirewallSupported(services []cloudstack.NetworkServiceInternal) bool {
+	for _, svc := range services {
+		if svc.Name == "Firewall" {
+			return true
+		}
+	}
+	return false
 }
 
 // EnsureLoadBalancerDeleted deletes the specified load balancer if it exists, returning
@@ -332,11 +366,14 @@ func (cs *CSCloud) getLoadBalancer(service *corev1.Service) (*loadBalancer, erro
 func (cs *CSCloud) verifyHosts(nodes []*corev1.Node) ([]string, string, error) {
 	hostNames := map[string]bool{}
 	for _, node := range nodes {
-		hostNames[strings.ToLower(node.Name)] = true
+		// node.Name can be an FQDN as well, and CloudStack VM names aren't
+		// To match, we need to Split the domain part off here, if present
+		hostNames[strings.Split(strings.ToLower(node.Name), ".")[0]] = true
 	}
 
 	p := cs.client.VirtualMachine.NewListVirtualMachinesParams()
 	p.SetListall(true)
+	p.SetDetails([]string{"min", "nics"})
 
 	if cs.projectID != "" {
 		p.SetProjectid(cs.projectID)
@@ -362,6 +399,10 @@ func (cs *CSCloud) verifyHosts(nodes []*corev1.Node) ([]string, string, error) {
 		}
 	}
 
+	if len(hostIDs) == 0 || len(networkID) == 0 {
+		return nil, "", fmt.Errorf("none of the hosts matched the list of VMs retrieved from CS API")
+	}
+
 	return hostIDs, networkID, nil
 }
 
@@ -370,7 +411,7 @@ func (lb *loadBalancer) hasLoadBalancerIP() bool {
 	return lb.ipAddr != "" && lb.ipAddrID != ""
 }
 
-// getLoadBalancerIP retieves an existing IP or associates a new IP.
+// getLoadBalancerIP retrieves an existing IP or associates a new IP.
 func (lb *loadBalancer) getLoadBalancerIP(loadBalancerIP string) error {
 	if loadBalancerIP != "" {
 		return lb.getPublicIPAddress(loadBalancerIP)
@@ -786,4 +827,42 @@ func (lb *loadBalancer) deleteFirewallRule(publicIpId string, publicPort int, pr
 	}
 
 	return deleted, err
+}
+
+// getStringFromServiceAnnotation searches a given v1.Service for a specific annotationKey and either returns the annotation's value or a specified defaultSetting
+func getStringFromServiceAnnotation(service *corev1.Service, annotationKey string, defaultSetting string) string {
+	klog.V(4).Infof("getStringFromServiceAnnotation(%s/%s, %v, %v)", service.Namespace, service.Name, annotationKey, defaultSetting)
+	if annotationValue, ok := service.Annotations[annotationKey]; ok {
+		//if there is an annotation for this setting, set the "setting" var to it
+		// annotationValue can be empty, it is working as designed
+		// it makes possible for instance provisioning loadbalancer without floatingip
+		klog.V(4).Infof("Found a Service Annotation: %v = %v", annotationKey, annotationValue)
+		return annotationValue
+	}
+	//if there is no annotation, set "settings" var to the value from cloud config
+	if defaultSetting != "" {
+		klog.V(4).Infof("Could not find a Service Annotation; falling back on cloud-config setting: %v = %v", annotationKey, defaultSetting)
+	}
+	return defaultSetting
+}
+
+// getBoolFromServiceAnnotation searches a given v1.Service for a specific annotationKey and either returns the annotation's boolean value or a specified defaultSetting
+func getBoolFromServiceAnnotation(service *corev1.Service, annotationKey string, defaultSetting bool) bool {
+	klog.V(4).Infof("getBoolFromServiceAnnotation(%s/%s, %v, %v)", service.Namespace, service.Name, annotationKey, defaultSetting)
+	if annotationValue, ok := service.Annotations[annotationKey]; ok {
+		returnValue := false
+		switch annotationValue {
+		case "true":
+			returnValue = true
+		case "false":
+			returnValue = false
+		default:
+			returnValue = defaultSetting
+		}
+
+		klog.V(4).Infof("Found a Service Annotation: %v = %v", annotationKey, returnValue)
+		return returnValue
+	}
+	klog.V(4).Infof("Could not find a Service Annotation; falling back to default setting: %v = %v", annotationKey, defaultSetting)
+	return defaultSetting
 }
